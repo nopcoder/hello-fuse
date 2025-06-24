@@ -11,6 +11,7 @@ import (
 	"os/user"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -43,7 +44,21 @@ var (
 	_ = (fs.NodeOnAdder)((*HelloRoot)(nil))
 )
 
-func getCurrentUIDGID() (uid, gid int, err error) {
+func resolveUIDGID(uid int64, gid int64) (uint32, uint32, error) {
+	currentUID, currentGID, err := getCurrentUIDGID()
+	if err != nil {
+		return 0, 0, err
+	}
+	if uid == -1 {
+		uid = int64(currentUID)
+	}
+	if gid == -1 {
+		gid = int64(currentGID)
+	}
+	return uint32(uid), uint32(gid), nil //nolint:gosec
+}
+
+func getCurrentUIDGID() (uid, gid uint32, err error) {
 	var currentUser *user.User
 	currentUser, err = user.Current()
 	if err != nil {
@@ -58,16 +73,10 @@ func getCurrentUIDGID() (uid, gid int, err error) {
 	if err != nil {
 		return
 	}
-	return uidInt, gidInt, nil //nolint:gosec
+	return uint32(uidInt), uint32(gidInt), nil //nolint:gosec
 }
 
 func main() {
-	defaultUID, defaultGID, err := getCurrentUIDGID()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error getting current UID/GID: %v\n", err)
-		os.Exit(1)
-	}
-
 	debug := flag.Bool("debug", false, "print debug data")
 
 	// fs.Options
@@ -76,9 +85,8 @@ func main() {
 	negativeTimeout := flag.Duration("negativeTimeout", time.Second, "fuse negative entry timeout")
 	firstAutomaticIno := flag.Uint64("firstAutomaticIno", 0, "first automatic inode number")
 	nullPermissions := flag.Bool("nullPermissions", false, "support null permissions")
-	uid := flag.Int("uid", defaultUID, "user id")
-	gid := flag.Int("gid", defaultGID, "group id")
-
+	uid := flag.Int64("uid", -1, "user id")
+	gid := flag.Int64("gid", -1, "group id")
 	// fuse.MountOptions
 	allowOther := flag.Bool("allowOther", false, "allow other users to access the file system")
 	maxBackground := flag.Int("maxBackground", 12, "max number of background requests")
@@ -104,12 +112,18 @@ func main() {
 	idMappedMount := flag.Bool("idMappedMount", false, "ID-mapped mount")
 	optionsStr := flag.String("options", "", "comma-separated mount options")
 	mountTimeout := flag.Duration("mountTimeout", 5*time.Second, "timeout for mounting the filesystem")
+
 	flag.Parse()
 	if len(flag.Args()) < 1 {
 		fmt.Printf("Usage:\n  hello-fuse [flags] MOUNTPOINT\n")
 		return
 	}
-
+	ruid, rgid, err := resolveUIDGID(*uid, *gid)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error resolving UID/GID: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Using UID: '%d', GID: '%d'\n", ruid, rgid)
 	var options []string
 	if *optionsStr != "" {
 		options = strings.Split(*optionsStr, ",")
@@ -122,8 +136,8 @@ func main() {
 		NegativeTimeout:   negativeTimeout,
 		FirstAutomaticIno: *firstAutomaticIno,
 		NullPermissions:   *nullPermissions,
-		UID:               uint32(*uid),
-		GID:               uint32(*gid),
+		UID:               ruid,
+		GID:               rgid,
 		MountOptions: fuse.MountOptions{
 			Debug:                    *debug,
 			AllowOther:               *allowOther,
@@ -152,48 +166,69 @@ func main() {
 		},
 	}
 
-	mountPoint := flag.Arg(0)
-
-	ctx := context.Background()
-	signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
-
-	cancel := startExitTimer(ctx, mountPoint, *mountTimeout)
-	server, mountErr := fs.Mount(mountPoint, &HelloRoot{}, opts)
-	cancel()
-	if mountErr != nil {
-		fmt.Fprintf(os.Stderr, "Mount fail: %v\n", err)
+	var (
+		server   *fuse.Server
+		mountErr error
+	)
+	done := make(chan struct{})
+	// Signal handling for graceful shutdown to call umount
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	mountpoint := flag.Arg(0)
+	go func() {
+		server, mountErr = fs.Mount(mountpoint, &HelloRoot{}, opts)
+		close(done)
+	}()
+	select {
+	case <-done:
+		if mountErr != nil {
+			fmt.Fprintf(os.Stderr, "Mount fail: %v\n", mountErr)
+			os.Exit(1)
+		}
+	case <-time.After(*mountTimeout):
+		fmt.Fprintf(os.Stderr, "ERROR: Mount failed timed out after %v\nHint: Perhaps mount directory busy? try runnning 'umount %s'\n", *mountTimeout, mountpoint)
 		os.Exit(1)
 	}
-
-	fmt.Println("Mount serve loop")
-	server.Wait()
-}
-
-func startExitTimer(ctx context.Context, mountPoint string, duration time.Duration) context.CancelFunc {
-	ctx, cancel := context.WithCancel(ctx)
+	// wait group for server
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	// Handle Ctrl+C or shell close
 	go func() {
-		select {
-		case <-time.After(duration):
-			fmt.Println("Timer expired, exiting...")
-			unmount(mountPoint) // make sure we unmount the filesystem
+		sig := <-sigCh
+		fmt.Printf("Received signal %v, Closing gracefully\n", sig)
+		cmd := exec.Command("umount", mountpoint)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		err := cmd.Run()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to unmount: %v\n", err)
 			os.Exit(1)
-		case <-ctx.Done():
-			fmt.Println("Timer canceled")
 		}
+		os.Exit(0)
 	}()
 
-	return cancel
+	go func() {
+		server.Wait()
+		wg.Done()
+	}()
+
+	// verify mount by trying to stat a file
+	go tryStatFile(mountpoint)
+	fmt.Println("Mount ready")
+	wg.Wait()
 }
 
-// Unmount the filesystem at the given mount point
-func unmount(mountPoint string) {
-	cmd := exec.Command("umount", mountPoint)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	err := cmd.Run()
+func tryStatFile(mountpoint string) {
+	var err error
+	for range 3 { // try 3 times
+		_, err = os.Stat(mountpoint + "/file.txt")
+		if err == nil {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to unmount %s: %v\n", mountPoint, err)
-	} else {
-		fmt.Printf("Unmounted %s successfully\n", mountPoint)
+		fmt.Fprintf(os.Stderr, "Mount failed, error stating file: %v\n", err)
+		os.Exit(1)
 	}
 }
