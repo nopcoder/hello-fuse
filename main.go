@@ -6,6 +6,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
+	"os/signal"
+	"os/user"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -39,7 +43,31 @@ var (
 	_ = (fs.NodeOnAdder)((*HelloRoot)(nil))
 )
 
+func getCurrentUIDGID() (uid, gid int, err error) {
+	var currentUser *user.User
+	currentUser, err = user.Current()
+	if err != nil {
+		return
+	}
+	var uidInt, gidInt int
+	uidInt, err = strconv.Atoi(currentUser.Uid)
+	if err != nil {
+		return
+	}
+	gidInt, err = strconv.Atoi(currentUser.Gid)
+	if err != nil {
+		return
+	}
+	return uidInt, gidInt, nil //nolint:gosec
+}
+
 func main() {
+	defaultUID, defaultGID, err := getCurrentUIDGID()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error getting current UID/GID: %v\n", err)
+		os.Exit(1)
+	}
+
 	debug := flag.Bool("debug", false, "print debug data")
 
 	// fs.Options
@@ -48,8 +76,8 @@ func main() {
 	negativeTimeout := flag.Duration("negativeTimeout", time.Second, "fuse negative entry timeout")
 	firstAutomaticIno := flag.Uint64("firstAutomaticIno", 0, "first automatic inode number")
 	nullPermissions := flag.Bool("nullPermissions", false, "support null permissions")
-	uid := flag.Uint("uid", 0, "user id")
-	gid := flag.Uint("gid", 0, "group id")
+	uid := flag.Int("uid", defaultUID, "user id")
+	gid := flag.Int("gid", defaultGID, "group id")
 
 	// fuse.MountOptions
 	allowOther := flag.Bool("allowOther", false, "allow other users to access the file system")
@@ -75,10 +103,10 @@ func main() {
 	maxStackDepth := flag.Int("maxStackDepth", 1, "maximum stacking depth")
 	idMappedMount := flag.Bool("idMappedMount", false, "ID-mapped mount")
 	optionsStr := flag.String("options", "", "comma-separated mount options")
-
+	mountTimeout := flag.Duration("mountTimeout", 5*time.Second, "timeout for mounting the filesystem")
 	flag.Parse()
 	if len(flag.Args()) < 1 {
-		fmt.Printf("Usage:\n  hello-fuse MOUNTPOINT\n")
+		fmt.Printf("Usage:\n  hello-fuse [flags] MOUNTPOINT\n")
 		return
 	}
 
@@ -123,10 +151,49 @@ func main() {
 			IDMappedMount:            *idMappedMount,
 		},
 	}
-	server, err := fs.Mount(flag.Arg(0), &HelloRoot{}, opts)
-	if err != nil {
+
+	mountPoint := flag.Arg(0)
+
+	ctx := context.Background()
+	signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+
+	cancel := startExitTimer(ctx, mountPoint, *mountTimeout)
+	server, mountErr := fs.Mount(mountPoint, &HelloRoot{}, opts)
+	cancel()
+	if mountErr != nil {
 		fmt.Fprintf(os.Stderr, "Mount fail: %v\n", err)
 		os.Exit(1)
 	}
+
+	fmt.Println("Mount serve loop")
 	server.Wait()
+}
+
+func startExitTimer(ctx context.Context, mountPoint string, duration time.Duration) context.CancelFunc {
+	ctx, cancel := context.WithCancel(ctx)
+	go func() {
+		select {
+		case <-time.After(duration):
+			fmt.Println("Timer expired, exiting...")
+			unmount(mountPoint) // make sure we unmount the filesystem
+			os.Exit(1)
+		case <-ctx.Done():
+			fmt.Println("Timer canceled")
+		}
+	}()
+
+	return cancel
+}
+
+// Unmount the filesystem at the given mount point
+func unmount(mountPoint string) {
+	cmd := exec.Command("umount", mountPoint)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err := cmd.Run()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to unmount %s: %v\n", mountPoint, err)
+	} else {
+		fmt.Printf("Unmounted %s successfully\n", mountPoint)
+	}
 }
